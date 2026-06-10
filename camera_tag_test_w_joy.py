@@ -146,7 +146,6 @@ else:
             f=int(buttons[1])            
             g=int(buttons[2])            
             h=int(buttons[3])
-            
             a1=a.to_bytes(1)
             b1=b.to_bytes(1)
             c1=c.to_bytes(1)

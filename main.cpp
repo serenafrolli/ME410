@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 
 //gcc -o week1 week_1_student.cpp -lwiringPi  -lm
-// forward declarations:
+// forward declaratiosns:
 int setup_imu();
 void calibrate_imu();      
 void read_imu(float *out);    
@@ -51,6 +51,25 @@ float intl_roll;
 float pitch_gyro_delta;
 float pitch_t = 0;
 float camera_yaw;
+// camera Y control
+float camera_y_estimated = 0.0;
+float camera_y_prev = 0.0;
+float pitch_desired_camera = 0.0;
+int last_cam_sequence = -1;
+long last_cam_time = 0;
+// camera X control
+float camera_x_estimated = 0.0;
+float camera_x_prev = 0.0;
+float roll_desired_camera = 0.0;
+int last_cam_sequence_x = -1;
+long last_cam_time_x = 0;
+// cam Z contrl
+float camera_z_estimated = 0.0;
+float camera_z_prev = 0.0;
+float auto_thrust = 0.0;
+float auto_thrust_integral = 0.0;
+int last_cam_sequence_z = -1;
+long last_cam_time_z = 0;
 
 // safety check vars
 #define A 0.01
@@ -79,16 +98,31 @@ float yaw_desired;
 
 #define thurst_min 0
 #define thrust_max 600 // FOR CAM
-#define thrust_neutral 600 // FOR CAM
-#define thrust_amplitude 300
+#define thrust_neutral 1200 // FOR CAM
+#define thrust_amplitude 1200
 #define pitch_amplitude 8
 #define roll_amplitude 8
-#define p_gain -6.5
-#define d_gain -2.4
+#define p_gain -3.2 // was 6.4, then 5
+#define d_gain -3 // was 2.4, then 2, 
 #define i_gain -.5
 #define i_saturation 100.0
 #define yaw_amplitude 80
-#define p_gain_yaw -7 // was -3
+#define p_gain_yaw -3 // was -3
+
+// camera gains
+#define p_gain_camera 12 //was 5, 12
+#define d_gain_camera 7.5 //was 27, 7.5
+#define desired_y 0.0
+#define p_gain_camera_x 9   // was 20, 9
+#define d_gain_camera_x 6 //was 1.75, 6
+#define camera_yaw_gain 0.10
+#define desired_x 0.0
+#define p_gain_camera_z 1200 // was 150
+#define d_gain_camera_z 400 // was -100
+#define i_gain_camera_z 0 // was -2
+#define z_auto_i_saturation 1200 // was 150
+#define desired_z 1.5
+
 
 //joystick integration 
 struct Joystick // data struct from udp_rx file
@@ -466,17 +500,91 @@ void trap(int signal)
 printf("control + C pressed\n");
 run_program = 0;
 }
-
+// CAMERA CONTROL
 void camera_control(float camera_yaw) {
   if (autonomy_paused) 
   {
     yaw_desired = -((joystick_data.yaw-128)/128.0 * yaw_amplitude);
-  // bla bla ADD MORE DAVI HERE
   }
   else 
   {
+
     camera_yaw = joystick_data.camera_yaw;
-    yaw_desired = 0 + ((camera_yaw * 0.05)*yaw_amplitude);
+    yaw_desired = 0 + ((camera_yaw * camera_yaw_gain)*yaw_amplitude);
+    
+    // Y control — only run when new camera data arrives
+    if (joystick_data.success == 1 && joystick_data.sequence_num != last_cam_sequence)
+    {
+      float camera_y = joystick_data.y;
+      // exponential filter
+      camera_y_estimated = camera_y_estimated * 0.6f + camera_y * 0.4f;
+
+      // time  since last camera update
+      float dt = (float)(te.tv_nsec - last_cam_time) / 1000000000.0f;
+      if (dt <= 0.0f || dt > 1.0f) dt = 0.033f;  // fallback ~30fps
+
+      // PD controller
+      float y_error = camera_y_estimated - desired_y;
+      float y_deriv = (camera_y_estimated - camera_y_prev) / dt;
+      pitch_desired_camera = p_gain_camera * y_error + d_gain_camera * y_deriv;
+      printf ("cam_y: %.3f pitch_cmd: %.3f\n", camera_y_estimated, pitch_desired_camera);
+
+      camera_y_prev = camera_y_estimated;
+      last_cam_sequence = joystick_data.sequence_num;
+      last_cam_time = te.tv_nsec;
+    }
+    // X control — only run when new camera data arrives
+    if (joystick_data.success == 1 && joystick_data.sequence_num != last_cam_sequence_x)
+    {
+      float camera_x = joystick_data.x;
+      // exponential filter
+      camera_x_estimated = camera_x_estimated * 0.6f + camera_x * 0.4f;
+
+      // time  since last camera update
+      float dt = (float)(te.tv_nsec - last_cam_time_x) / 1000000000.0f;
+      if (dt <= 0.0f || dt > 1.0f) dt = 0.033f;  // fallback ~30fps
+
+      // PD controller
+      float x_error = camera_x_estimated - desired_x;
+      float x_deriv = (camera_x_estimated - camera_x_prev) / dt;
+      roll_desired_camera = p_gain_camera_x * x_error + d_gain_camera_x * x_deriv;
+
+      camera_x_prev = camera_x_estimated;
+      last_cam_sequence_x = joystick_data.sequence_num;
+      last_cam_time_x = te.tv_nsec;
+    }
+    if (joystick_data.success == 1 && joystick_data.sequence_num != last_cam_sequence_z)
+    {
+      float camera_z = joystick_data.z;
+      // exponential filter
+      camera_z_estimated = camera_z_estimated * 0.6f + camera_z * 0.4f;
+
+      // time since last camera update
+      float dt = (float)(te.tv_nsec - last_cam_time_z) / 1000000000.0f;
+      if (dt <= 0.0f || dt > 1.0f) dt = 0.033f;  // fallback ~30fps
+
+      //PID controller
+      float z_error = camera_z_estimated - desired_z;
+      float z_deriv = (camera_z_estimated - camera_z_prev) / dt;
+
+      if (autonomy_paused) {
+        auto_thrust_integral = 0.0f;
+      } else {
+        auto_thrust_integral += i_gain_camera_z * z_error * dt;
+        auto_thrust_integral = fmaxf(fminf(auto_thrust_integral, z_auto_i_saturation), -z_auto_i_saturation);
+      }
+
+      //auto_thrust_integral += i_gain_camera_z * z_error * dt;
+      //auto_thrust_integral = fmaxf(fminf(auto_thrust_integral, z_auto_i_saturation), -z_auto_i_saturation);
+
+      auto_thrust = p_gain_camera_z * z_error + d_gain_camera_z * z_deriv + auto_thrust_integral;
+
+      printf("cam_z: %.3f auto_thrust: %.3f\n", camera_z_estimated, auto_thrust);
+
+      camera_z_prev = camera_z_estimated;
+      last_cam_sequence_z = joystick_data.sequence_num;
+      last_cam_time_z = te.tv_nsec;
+    }
   }
 }
 
@@ -484,16 +592,45 @@ void calculate_motors()
 {
   //printf("set motors called\n");
   float thrust_desired = (((joystick_data.thrust-128)/128.0) * thrust_amplitude);
-  float thrust = thrust_neutral - thrust_desired;
+  float thrust_joystick = thrust_neutral - thrust_desired;
+  float thrust;
+  if (autonomy_paused)
+  {
+    thrust = thrust_joystick;
+  }
+  else
+  {
+    thrust = 0.5f * thrust_joystick + 0.5f * (thrust_neutral + auto_thrust);
+  }
 
-  pitch_desired = ((joystick_data.pitch-128)/128.0 * pitch_amplitude);
+  float pitch_desired_joystick = ((joystick_data.pitch-128)/128.0 * pitch_amplitude);
+
+  if (autonomy_paused)
+  {
+    pitch_desired = pitch_desired_joystick;
+  }
+  else
+  {
+    pitch_desired = pitch_desired_joystick * 0.0f - pitch_desired_camera * 1.0f;
+  }
+
   //printf("DEBUG raw_joy=%d  pitch_desired=%f\n", joystick_data.pitch, pitch_desired);
   float pitch_error = pitch_desired - pitch_t;
 
-  roll_desired = -((joystick_data.roll-128)/128.0 * roll_amplitude);
+  float roll_desired_joystick = -((joystick_data.roll-128)/128.0 * roll_amplitude);
+
+  if (autonomy_paused)
+  {
+    roll_desired = roll_desired_joystick;
+  }
+  else
+  {
+    roll_desired = roll_desired_joystick * 0.0f + roll_desired_camera * 1.0f;
+  }
+
   float roll_error = roll_desired - roll_t;
 
-  //yaw_desired = -((joystick_data.yaw-128)/128.0 * yaw_amplitude);
+
   float yaw_error = yaw_desired - temp[3];   // temp[5] = z-gyro = yaw rate
 
   pid_integral_pitch = fmaxf(fminf((i_gain * pitch_error)+pid_integral_pitch, i_saturation), -i_saturation);
@@ -541,11 +678,26 @@ void calculate_motors()
   }
 
   FILE *fs_yaw = fopen("/home/pi/0008.csv", "a");
-  if (fs_yaw) {
+  if (fs_yaw) 
+  {
     fprintf(fs_yaw, "%10.5f,%10.5f,%10.5f,%10.5f,%10.5f,%10.5f\n",
           temp[7], pitch_gyro_delta, pitch_desired, pitch_t);
   fclose(fs_yaw);
-}
+  }
+    // log thrust inputs: joystick desired thrust and camera auto thrust and camera z height
+    static FILE *fs_thrust = NULL;
+  if (fs_thrust == NULL) {
+    fs_thrust = fopen("/home/pi/0010_thrust.csv", "w");
+  }
+  if (fs_thrust) {
+    fprintf(fs_thrust, "%10.5f,%10.5f,%10.5f,%10.5f,%10.5f\n",
+            thrust_joystick, auto_thrust, camera_z_estimated,
+            camera_x_estimated, camera_y_estimated);
+    fflush(fs_thrust);
+  }
+
+
+
 }
 
 void set_motors(int motor0, int motor1, int motor2, int motor3)
